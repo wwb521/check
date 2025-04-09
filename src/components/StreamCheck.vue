@@ -175,6 +175,17 @@
             label="分组"
             width="120"
             align="center">
+          <template slot="header">
+            <div style="display: flex; align-items: center; justify-content: center;">
+              <span>分组</span>
+              <el-button
+                  type="text"
+                  icon="el-icon-setting"
+                  style="padding: 0 0 0 5px;"
+                  @click="groupSettingsDialogVisible = true">
+              </el-button>
+            </div>
+          </template>
           <template slot-scope="scope">
             <el-tag
                 type="info">
@@ -614,6 +625,29 @@
         <el-button type="primary" @click="saveGithubSettings">保 存</el-button>
       </div>
     </el-dialog>
+
+    <!-- 分组设置对话框 -->
+    <el-dialog
+        title="分组规则设置"
+        :visible.sync="groupSettingsDialogVisible"
+        width="600px">
+      <div class="group-settings-help">
+        <p>设置格式：分组名称:关键词1#关键词2#关键词3</p>
+        <p>每行一个分组规则，例如：</p>
+        <p>央视频道:CCTV#cctv#CHC</p>
+        <p>卫视频道:湖南#湖北#陕西</p>
+      </div>
+      <el-input
+          type="textarea"
+          v-model="groupSettingsForm.rules"
+          :rows="10"
+          placeholder="请输入分组规则，每行一个">
+      </el-input>
+      <div slot="footer">
+        <el-button @click="groupSettingsDialogVisible = false">取 消</el-button>
+        <el-button type="primary" @click="saveGroupSettings">保 存</el-button>
+      </div>
+    </el-dialog>
   </div>
 
 </template>
@@ -764,6 +798,10 @@ export default {
         CCTV: '央视频道',
         SATELLITE: '卫视频道'
       },
+      groupSettingsDialogVisible: false,
+      groupSettingsForm: {
+        rules: ''
+      },
     }
   },
   computed: {
@@ -811,14 +849,31 @@ export default {
     }
   },
   created() {
+    // 从localStorage加载分组设置
+    const savedGroupSettings = localStorage.getItem('groupSettings')
+    if (savedGroupSettings) {
+      this.groupSettingsForm = JSON.parse(savedGroupSettings)
+    } else {
+      // 设置默认的分组规则
+      this.groupSettingsForm = {
+        rules: '央视频道:CCTV#cctv#CHC\n卫视频道:湖南#湖北#陕西'
+      }
+      // 保存默认规则到localStorage
+      localStorage.setItem('groupSettings', JSON.stringify(this.groupSettingsForm))
+    }
+
     // 初始化时加载持久化的数据
     if (localStorage.getItem('persistentData') === 'true') {
       const savedList = localStorage.getItem('streamList')
       if (savedList) {
         this.streamList = JSON.parse(savedList)
+        // 初始化时应用分组规则到所有直播源
+        this.streamList.forEach(stream => {
+          stream.group = this.applyGroupRules(stream.name)
+        })
         // 初始化时检查多播源
         this.$nextTick(() => {
-          this.checkMulticastStreams() // 使用新方法
+          this.checkMulticastStreams()
         })
       }
     }
@@ -1277,6 +1332,7 @@ export default {
           const uniqueStreams = newStreams.filter(s => !existingUrls.has(s.url))
           
           if (uniqueStreams.length > 0) {
+            // 批量添加到列表
             this.streamList.push(...uniqueStreams)
             this.$message.success(`成功导入 ${uniqueStreams.length} 个直播源`)
             this.importUrlDialogVisible = false
@@ -1419,33 +1475,22 @@ export default {
     addStreamsToList(streams) {
       // 标准化所有流的分组名称
       streams.forEach(stream => {
-        // 优先根据名称判断分组，不区分大小写
-        if (/CCTV/i.test(stream.name)) {
-          stream.group = this.STANDARD_GROUPS.CCTV
-        } else if (/卫视/.test(stream.name)) {
-          stream.group = this.STANDARD_GROUPS.SATELLITE
-        }
+        // 应用分组规则
+        stream.group = this.applyGroupRules(stream.name)
       })
 
       // 检查重复并添加到列表
-      const existingStreams = new Set(
+      const existingKeys = new Set(
         this.streamList.map(s => `${s.url}|${s.group}`)
       )
 
       const uniqueStreams = streams.filter(stream => {
         const key = `${stream.url}|${stream.group}`
-        if (existingStreams.has(key)) {
+        if (existingKeys.has(key)) {
           return false
         }
-        existingStreams.add(key)
+        existingKeys.add(key)
         return true
-      })
-
-      // 添加到列表前再次确认CCTV频道分组
-      uniqueStreams.forEach(stream => {
-        if (/CCTV/i.test(stream.name)) {
-          stream.group = this.STANDARD_GROUPS.CCTV
-        }
       })
 
       this.streamList.push(...uniqueStreams)
@@ -1474,6 +1519,8 @@ export default {
             this.streamList.map(s => `${s.url}|${s.group}`)
           )
           const uniqueStreams = newStreams.filter(s => {
+            // 先应用分组规则
+            s.group = this.applyGroupRules(s.name)
             const key = `${s.url}|${s.group}`
             if (existingKeys.has(key)) {
               return false
@@ -1507,12 +1554,8 @@ export default {
       }
     },
     getGroupFromFileName(filename) {
-      // 从文件名中提取可能的分组名
-      const name = filename.toLowerCase()
-      if (/cctv/i.test(name)) return this.STANDARD_GROUPS.CCTV
-      if (name.includes('卫视')) return this.STANDARD_GROUPS.SATELLITE
-      if (name.includes('地方')) return '地方台'
-      return '未分组'
+      if (!filename) return '未分组'
+      return this.applyGroupRules(filename)
     },
     handleClearList() {
       this.$confirm('确认清空列表吗？', '提示', {
@@ -1629,14 +1672,20 @@ export default {
       this.isCollecting = true
       this.saveState() // 保存状态
       
-      // 立即执行一次采集
-      await this.collect()
-      
-      // 如果开启了自动采集，设置定时器
-      if (this.collectForm.autoCollect) {
-        this.setupCollectSchedule()
-      } else {
-        // 单次采集完成后停止
+      try {
+        // 立即执行一次采集
+        await this.collect()
+        
+        // 如果开启了自动采集，设置定时器
+        if (this.collectForm.autoCollect) {
+          this.setupCollectSchedule()
+        } else {
+          // 单次采集完成后停止
+          this.isCollecting = false
+          this.saveState()
+        }
+      } catch (error) {
+        console.error('采集过程出错:', error)
         this.isCollecting = false
         this.saveState()
       }
@@ -1671,42 +1720,35 @@ export default {
         progressMessage = this.$message({
           message: `正在采集: 0/${total}`,
           type: 'info',
-          duration: 0,  // 消息不会自动关闭
+          duration: 0,
           showClose: false
         });
-        
-        // 将URL列表分批处理，每批最多5个
-        const batchSize = 5
-        const urlBatches = []
-        for (let i = 0; i < this.collectForm.urls.length; i += batchSize) {
-          urlBatches.push(this.collectForm.urls.slice(i, i + batchSize))
-        }
-        
+
         let allResults = []
         let current = 0
-        
-        // 处理每一批URL
-        for (const batch of urlBatches) {
-          const batchPromises = batch.map(async (url) => {
-            try {
-              const response = await fetch(`${this.getBaseUrl()}/api/collect-url?url=${encodeURIComponent(url)}`, {
-                method: 'GET',
-                headers: {
-                  'Accept': 'text/plain'
-                },
-              })
-              
-              if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-              }
-              
-              const content = await response.text()
-              const newStreams = this.parseContent(content)
-              
+
+        // 逐个处理URL，避免并行处理
+        for (const url of this.collectForm.urls) {
+          try {
+            const response = await fetch(`${this.getBaseUrl()}/api/collect-url?url=${encodeURIComponent(url)}`, {
+              method: 'GET',
+              headers: {
+                'Accept': 'text/plain'
+              },
+            })
+            
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+            }
+            
+            const content = await response.text()
+            const streams = this.parseContent(content)
+            
+            if (streams.length > 0) {
               // 根据采集模式过滤直播源
-              let filteredStreams = newStreams
+              let filteredStreams = streams
               if (this.collectForm.mode === 'tv') {
-                filteredStreams = newStreams.filter(s => {
+                filteredStreams = streams.filter(s => {
                   // 处理央视频道
                   const isCCTV = /CCTV/i.test(s.name)
                   if (isCCTV) {
@@ -1727,74 +1769,68 @@ export default {
                 })
               }
               
-              // 再次确保所有CCTV频道都在正确分组
-              filteredStreams.forEach(s => {
-                if (/CCTV/i.test(s.name)) {
-                  s.group = this.STANDARD_GROUPS.CCTV
-                }
+              // 应用分组规则
+              filteredStreams.forEach(stream => {
+                stream.group = this.applyGroupRules(stream.name)
               })
-
-              current++
-              // 更新进度消息
-              if (progressMessage) {
-                progressMessage.message = `正在采集: ${Math.min(current, total)}/${total}`;
-              }
               
-              return { status: 'fulfilled', value: filteredStreams }
-            } catch (error) {
-              current++
-              // 更新进度消息（即使失败也计入进度）
-              if (progressMessage) {
-                progressMessage.message = `正在采集: ${Math.min(current, total)}/${total}`;
-              }
-              console.error(`采集地址失败 ${url}:`, error)
-              return { status: 'rejected', reason: error }
+              allResults.push(...filteredStreams)
             }
-          })
-          
-          const batchResults = await Promise.all(batchPromises)
-          allResults = allResults.concat(batchResults)
-        }
+          } catch (error) {
+            console.error(`采集地址失败 ${url}:`, error)
+          }
 
-        // 合并所有采集结果
-        const allNewStreams = allResults
-          .filter(result => result.status === 'fulfilled')
-          .flatMap(result => result.value)
-          .filter((stream, index, self) => 
-            index === self.findIndex(s => s.url === stream.url)
-          )
+          // 更新进度
+          current++
+          if (progressMessage) {
+            progressMessage.message = `正在采集: ${current}/${total}`
+          }
+
+          // 每处理完一个URL，暂停一下
+          await new Promise(resolve => setTimeout(resolve, 200))
+        }
 
         // 关闭进度消息
         if (progressMessage) {
-          progressMessage.close();
+          progressMessage.close()
         }
 
-        // 添加新的直播源到列表
-        if (allNewStreams.length > 0) {
-          this.addStreamsToList(allNewStreams)
-          const modeText = this.collectForm.mode === 'tv' ? '央视卫视' : ''
-          this.$message.success(`采集成功: 新增${allNewStreams.length}个${modeText}直播源`)
+        if (allResults.length > 0) {
+          // 过滤重复项（同时考虑URL和分组）
+          const existingKeys = new Set(this.streamList.map(s => `${s.url}|${s.group}`))
+          const uniqueStreams = allResults.filter(s => {
+            const key = `${s.url}|${s.group}`
+            if (existingKeys.has(key)) {
+              return false
+            }
+            existingKeys.add(key)
+            return true
+          })
+          
+          if (uniqueStreams.length > 0) {
+            // 分批添加到列表，每批50个
+            const addBatchSize = 50
+            for (let i = 0; i < uniqueStreams.length; i += addBatchSize) {
+              const batch = uniqueStreams.slice(i, i + addBatchSize)
+              this.streamList.push(...batch)
+              // 每添加一批，暂停一下
+              await new Promise(resolve => setTimeout(resolve, 100))
+            }
+            
+            this.$message.success(`成功采集 ${uniqueStreams.length} 个直播源`)
+            this.saveStreamList()
+          } else {
+            this.$message.info('没有新的直播源可以导入')
+          }
         } else {
-          const modeText = this.collectForm.mode === 'tv' ? '央视卫视' : ''
-          this.$message.info(`未发现新的${modeText}直播源`)
+          this.$message.warning('未找到有效的直播源')
         }
-
-        // 统计失败的地址
-        const failedUrls = allResults.filter(result => result.status === 'rejected').length
-        if (failedUrls > 0) {
-          this.$message.warning(`${failedUrls}个地址采集失败`)
-        }
-
       } catch (error) {
         console.error('采集失败:', error)
-        this.$message.error('采集失败：' + error.message)
-        if (!this.collectForm.autoCollect) {
-          this.stopCollecting()
-        }
+        this.$message.error('采集失败: ' + error.message)
       } finally {
-        // 确保进度消息被关闭
         if (progressMessage) {
-          progressMessage.close();
+          progressMessage.close()
         }
       }
     },
@@ -2754,9 +2790,21 @@ export default {
         const newStreams = this.parseContent(content)
         
         if (newStreams.length > 0) {
-          // 提取URL列表并过滤重复项
-          const existingUrls = new Set(this.streamList.map(s => s.url))
-          const uniqueStreams = newStreams.filter(s => !existingUrls.has(s.url))
+          // 应用分组规则
+          newStreams.forEach(stream => {
+            stream.group = this.applyGroupRules(stream.name)
+          })
+
+          // 提取URL列表并过滤重复项（同时考虑URL和分组）
+          const existingKeys = new Set(this.streamList.map(s => `${s.url}|${s.group}`))
+          const uniqueStreams = newStreams.filter(s => {
+            const key = `${s.url}|${s.group}`
+            if (existingKeys.has(key)) {
+              return false
+            }
+            existingKeys.add(key)
+            return true
+          })
           
           if (uniqueStreams.length > 0) {
             // 批量添加到列表
@@ -2998,6 +3046,46 @@ export default {
         console.error('导入失败:', error)
         this.$message.error('导入失败: ' + error.message)
       }
+    },
+    saveGroupSettings() {
+      // 保存分组规则到localStorage
+      localStorage.setItem('groupSettings', JSON.stringify(this.groupSettingsForm))
+      
+      // 重新应用分组规则到所有直播源
+      this.streamList.forEach(stream => {
+        stream.group = this.applyGroupRules(stream.name)
+      })
+      
+      this.$message.success('分组规则已保存并应用')
+      this.groupSettingsDialogVisible = false
+      
+      // 保存更新后的列表
+      this.saveStreamList()
+    },
+    applyGroupRules(name) {
+      if (!name) return '未分组'
+
+      // 解析分组规则
+      const rules = this.groupSettingsForm.rules.split('\n').filter(rule => rule.trim())
+      for (const rule of rules) {
+        if (!rule.includes(':')) continue
+        
+        const [groupName, keywords] = rule.split(':')
+        if (!keywords) continue
+        
+        const patterns = keywords.split('#').filter(k => k.trim())
+        if (patterns.length === 0) continue
+        
+        try {
+          if (new RegExp(patterns.join('|'), 'i').test(name)) {
+            return groupName.trim()
+          }
+        } catch (e) {
+          console.error('分组规则格式错误:', e)
+        }
+      }
+      
+      return '未分组'
     },
   },
   watch: {
@@ -3324,5 +3412,16 @@ export default {
 .message-list-leave-to {
   transform: translateX(100%);
   opacity: 0;
+}
+
+.group-settings-help {
+  margin-bottom: 15px;
+  color: #666;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.group-settings-help p {
+  margin: 5px 0;
 }
 </style> 
